@@ -1,0 +1,91 @@
+start	stop	disease_number
+# Transportation services including ambulance
+A0021	A0999	78
+# Other supplies including diabetes supplies and contraceptives
+A4244	A4291	79
+# Diabetic footwear
+A5500	A5514	80
+# Breathing aids
+A7000	A7047	81
+# Administrative, miscellaneous and experimental
+A9150	A9999	82
+# Walking aids and attachments
+E0100	E0159	83
+# Hospital beds and associated supplies
+E0250	E0374	84
+# Oxygen delivery systems and related supplies
+E0424	E0487	85
+# Humidifiers and nebulizers with related equipment
+E0550	E0602	86
+# Wheelchair or transport chair and related accessories
+E0950	E1299	87
+# Wheelchair or transport chair and related accessories
+E2201	E2295	87
+# Wheelchair or transport chair and related accessories
+E2300	E2399	87
+# Wheelchair or transport chair and related accessories
+E2601	E2622	87
+# Accessories for oxygen delivery devices
+E1353	E1407	88
+# Vaccine administration
+G0008	G0011	89
+# Screening examinations and disease management training
+G0101	G0125	90
+# Drugs, administered by injection
+J0120	J7131	91
+# Inhalation solutions
+J7608	J7685	92
+# Wheelchairs, components, and accessories
+K0001	K0463	93
+# Wheelchairs, components, and accessories
+K0669	K0669	93
+# Office/other outpatient visit – established patient
+99214	99215	53
+# Hospital care – initial
+99222	99223	54
+# Office consultation
+99242	99243	55
+# Office consultation
+99245	99246	56
+# Nursing facility care – subsequent
+99308	99309	57
+# Preventive medicine services
+99381	99429	58
+# Anesthesia – head
+00100	00223	59
+# Anesthesia – neck
+00300	00353	60
+# Anesthesia – intrathoracic
+00500	00581	61
+# Anesthesia – lower abdomen
+00800	00883	62
+# Anesthesia – knee and popliteal area
+01320	01445	63
+# Surgery – respiratory system
+30000	32999	64
+# Surgery – female genital system
+56405	58999	65
+# Surgery – nervous system
+61000	64999	66
+# Radiology – nuclear medicine
+78000	79999	67
+# Therapeutic drug assays
+80150	80299	68
+# Cytopathology
+88104	88199	69
+# Surgical pathology
+88300	88399	70
+# Medicine – Ophthalmology
+92002	92499	71
+# Medicine – Cardiovascular
+92950	93799	72
+# Medicine – Noninvasive vascular diagnostic studies
+93875	93991	73
+# Allergy and clinical immunology
+95004	95199	74
+# Physical medicine and rehabilitation
+97001	97799	75
+# Chiropractic manipulative treatment
+98940	98944	76
+# Special services, procedures and reports
+99000	99092	77

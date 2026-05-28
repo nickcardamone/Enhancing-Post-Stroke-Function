@@ -1,0 +1,1663 @@
+---
+title: "Analysis Plan - v12"
+author: "Nick Cardamone"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+## Set up
+
+```{r setup, include=FALSE}
+source("00_config.R")
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(data.table)
+  library(lubridate)
+  library(arrow)
+  library(openxlsx)
+  library(mice)
+  library(table1)
+  library(dplyr)
+  library(miceadds)
+  library(EnvStats)
+  library(mitools)
+  library(gt)
+  library(gtsummary)
+  library(knitr)
+  library(downloadthis)
+})
+```
+
+```{r figure setup}
+library(ggsci)
+
+# Common theme for all figures
+common_theme <- theme_bw() + 
+  theme(text = element_text(size = 14), 
+        axis.title = element_text(size = 14), 
+        legend.spacing.x = unit(0.5, 'cm'), 
+        legend.key.size = unit(1.0, "cm"),  
+        panel.border = element_blank(), 
+        axis.line = element_line(colour = "black"))
+
+# Common y-axis scale
+common_y <- scale_y_continuous(limits = c(10, 60), breaks = seq(10, 60, by = 5))
+```
+
+### Load hospitalization-level dataset
+
+```{r load dataset, eval = FALSE}
+analysis_data <- load_parquet_safe("analysis_data.parquet")
+```
+
+```{r, eval = FALSE}
+analysis_data <- analysis_data %>% 
+  arrange(SCRSSN, ADMSNDT, desc(episode_run)) %>%
+  group_by(SCRSSN, ADMSNDT) %>%
+  mutate(total_post_acute = max(episode_run) - 1) %>%
+  ungroup()
+```
+
+```{r eval = FALSE}
+admsn_vars <- names(analysis_data)[grepl("_ADMSN$", names(analysis_data))]
+
+analysis_data_final <- analysis_data %>%
+  group_by(SCRSSN, ADMSNDT) %>%
+  summarize(
+    across(all_of(admsn_vars), ~.[episode_run == min(episode_run)][[1]]),
+    across(!all_of(c(admsn_vars)), ~.[episode_run == max(episode_run)][[1]]),
+    .groups = "drop"
+  )
+```
+
+```{r, eval = FALSE}
+patient_episode_counts <- analysis_data_final %>%
+  group_by(SCRSSN) %>%
+  summarise(n_episodes = n(), .groups = "drop")
+
+set.seed(12345)
+analysis_data_patient <- analysis_data_final %>%
+  left_join(patient_episode_counts, by = "SCRSSN") %>%
+  group_by(SCRSSN) %>%
+  slice_sample(n = 1) %>%
+  ungroup()
+```
+
+### Create patient-level dataset
+
+```{r load patient-level dat, eval = FALSE}
+analysis_data_patient <- analysis_data_patient %>% 
+    transmute(
+      PatientICN,
+      SCRSSN,
+      calendar_year = factor(year(ADMSNDT)),
+      acute_admsndt = ADMSNDT,
+      acute_dschrgdt = DSCHRGDT,
+      acute_los = acute_los,
+      acute_icu = factor(if_else(Acute_Inpatient_ICU == 1, "Yes", "No"), levels = c("No", "Yes")),
+      acute_setting = factor(inpatient_setting, levels = c("VA", "Non-VA", "Both")),
+      acute_stroke_severity = acu_stroke_severity,
+      dob,
+      dod,
+      total_post_acute = factor(if_else(total_post_acute == 1, "One",
+                                        if_else(total_post_acute == 2, "Two", "Three or more")),
+                                levels = c("One", "Two", "Three or more")),
+      multiple_post_acute = factor(if_else(total_post_acute == "One", "One", "Multiple"),
+                                   levels = c("One", "Multiple")),
+      stroke_type = factor(case_when(
+        StrokeType == "Ischemic"    ~ "Ischemic",
+        StrokeType == "Hemorrhagic" ~ "Hemorrhagic",
+        TRUE ~ NA
+      ), levels = c("Ischemic", "Hemorrhagic")),
+      age = Age_ADMSNDT,
+      age_category = case_when(
+        Age_ADMSNDT >= 65 & Age_ADMSNDT < 70 ~ "65-69",
+        Age_ADMSNDT >= 70 & Age_ADMSNDT < 75 ~ "70-74",
+        Age_ADMSNDT >= 75 & Age_ADMSNDT < 80 ~ "75-79",
+        Age_ADMSNDT >= 80 & Age_ADMSNDT < 85 ~ "80-84",
+        Age_ADMSNDT >= 85                     ~ "85+",
+        TRUE ~ NA
+      ),
+      age_category = factor(age_category, levels = c("65-69", "70-74", "75-79", "80-84", "85+")),
+      Gender = factor(case_when(
+        Gender == "MALE"   ~ "Male",
+        Gender == "FEMALE" ~ "Female"
+      ), levels = c("Male", "Female")),
+      marital_status = case_when(
+        MaritalStatus == "MARRIED"       ~ "Married",
+        MaritalStatus == "DIVORCED"      ~ "Separated/Widowed/Divorced",
+        MaritalStatus == "SEPARATED"     ~ "Separated/Widowed/Divorced",
+        MaritalStatus == "WIDOWED"       ~ "Separated/Widowed/Divorced",
+        MaritalStatus == "NEVER MARRIED" ~ "Never Married",
+        TRUE ~ NA
+      ),
+      marital_status = factor(marital_status,
+                              levels = c("Married", "Separated/Widowed/Divorced", "Never Married")),
+      race_category = case_when(
+        race == "White"                                          ~ "White",
+        race == "Black"                                          ~ "Black",
+        race %in% c("American_Indian_AN", "Asian_PI", "Other")  ~ "Other",
+        TRUE ~ NA
+      ),
+      race_category = factor(race_category, levels = c("White", "Black", "Other")),
+      ethnicity_category = case_when(
+        eth == "NotHispanic" ~ "Not Hispanic/Latino",
+        eth == "Hispanic"    ~ "Hispanic/Latino",
+        TRUE ~ NA
+      ),
+      ethnicity_category = factor(ethnicity_category,
+                                  levels = c("Not Hispanic/Latino", "Hispanic/Latino")),
+      rurality = case_when(
+        GISURH == "U"                    ~ "Urban",
+        GISURH %in% c("R", "H", "I")    ~ "Rural/Highly Rural/Islander",
+        TRUE ~ NA
+      ),
+      rurality = factor(rurality, levels = c("Urban", "Rural/Highly Rural/Islander")),
+      adi = ADI_NATRANK,
+      va_hospitalization    = factor(if_else(any_VA == 1, "Yes", "No"), levels = c("No", "Yes")),
+      va_primary_care_ever  = factor(if_else(va_primary_care_ever == 1, "Yes", "No"),
+                                     levels = c("No", "Yes")),
+      post_acute_setting    = factor(Grouping, levels = c("IRF", "SNF", "HH")),
+      post_acute_los        = los,
+      prior_twoyear_pdx_stroke  = factor(if_else(py2_any_pdx_stroke == 1, "Yes", "No"),
+                                          levels = c("No", "Yes")),
+      prior_twoyear_charlson    = as.numeric(p2_charlson_cindex),
+      prior_year_kim_frailty    = p1_frailty_index,
+      prior_year_hospitalization = factor(if_else(p1_count_inpat > 0, "Yes", "No"),
+                                          levels = c("No", "Yes")),
+      prior_cognition_score = as.factor(if_else(prior_cognition_score == 0, NA,
+                                                as.character(prior_cognition_score))),
+      prior_self_care_score = as.factor(if_else(prior_self_care_score == 0, NA,
+                                                as.character(prior_self_care_score))),
+      prior_mobility_score  = as.factor(if_else(prior_mobility_score == 0, NA,
+                                                as.character(prior_mobility_score))),
+      baseline_gg   = GG_total_ADMSN,
+      discharge_gg  = GG_total_DSCHRG,
+      gg_val_GG0130A_ADMSN, gg_val_GG0130B_ADMSN, gg_val_GG0130C_ADMSN,
+      gg_val_GG0170A_ADMSN, gg_val_GG0170B_ADMSN, gg_val_GG0170C_ADMSN,
+      gg_val_GG0170D_ADMSN, gg_val_GG0170E_ADMSN, gg_val_GG0170F_ADMSN,
+      gg_val_GG0170I_ADMSN, gg_val_GG0170J_ADMSN, gg_val_GG0170R_ADMSN,
+      gg_val_GG0170S_ADMSN,
+      gg_val_GG0130A_DSCHRG, gg_val_GG0130B_DSCHRG, gg_val_GG0130C_DSCHRG,
+      gg_val_GG0170A_DSCHRG, gg_val_GG0170B_DSCHRG, gg_val_GG0170C_DSCHRG,
+      gg_val_GG0170D_DSCHRG, gg_val_GG0170E_DSCHRG, gg_val_GG0170F_DSCHRG,
+      gg_val_GG0170I_DSCHRG, gg_val_GG0170J_DSCHRG, gg_val_GG0170R_DSCHRG,
+      gg_val_GG0170S_DSCHRG
+    )
+
+save_parquet_safe(analysis_data_patient, "analysis_data_patient.parquet")
+```
+### CONSORT Exclusiosn chart
+
+```{r}
+# CONSORT diagram exclusions script:
+
+source("00_config.R")
+
+# Load required packages
+load_packages(c("dplyr", "dbplyr", "DBI", "VINCI", "arrow", "data.table",
+                "table1", "stringr", "tidyr", "ggplot2", "scales", "tidytable", "kableExtra"))
+
+# Set working directory
+setwd(project_base)
+con <- connect_db(database = db_project, server = db_server)
+
+# Load parquet files
+
+# Exclusions steps:
+# Start: All veterans hospitalized with a primary discharge diagnosis of stroke Jan 1 2019- Dec 31 2022
+# Exclusion 1: Limit to veterans found in the RHF 
+# Exclusion 2: Limit to hospitalizations that have a matching RHF inpatient episode (+/- 1 day overlap) and are followed by IRF/SNF or HH within 3 days or 14 days of hospital discharge 
+# Exclusion 3: Limit to hospitalizations that satisfy the following criteria: 
+#               - not readmitted from post-acute care stay
+#               - did not die during post-acute care stay or witihn one day of discharge or did not have "death" as reason for no OASIS/MDS/IRFPAI assessment followup data
+#               - did not have "unplanned discharge" listed on their OASIS/MDS/IRFPAI
+#               - post-acute care episodes were not all too short (3 days or fewer)
+#               - patient was not younger than 65 or older than 99 at the time of hospitalization
+#               - acute hospitalization was not more than 365 days.
+# Exclusion 4: Limit to hospitalizations that satisfy the following criteria:
+#               - no matched assessment record (GG data)
+#               - Post-acute care was not VA SNF only
+#               - Post-acute care was not VA Purchase Home Health only
+#               - Post-acute care was not VA IRF only (those without assessment data)
+# Exclusion 5: Limit to hospitalizations with at least one post-acute episode with at least one GG item at admission or discharge with a valid score (i.e. 01, 02, 03, 04, 05, 06).
+# Exclusion 6: For patients with more than one eligible hospitalization (and subsequent post-acute care stay) at this point, randomly select one hospitalization.
+
+con <- connect_db(database = db_project, server = db_server)
+
+elig_rhf <- load_parquet_safe("dt_post_acute_elig.parquet") %>%
+  mutate(setting_series = map_chr(settings, ~paste(.x, collapse = "|")))
+
+start <- load_parquet_safe("pdx_stroke_visit_summary.parquet") 
+
+start <- start%>% mutate(scrssn = SCRSSN, ADMSNDT = ACUTE_INPATIENT_VISIT_START)
+
+groupings_file <- file.path(project_base, "Groupings.xlsx")
+Groupings <- readxl::read_xlsx(groupings_file) %>% 
+  mutate(Grouping = if_else(Grouping == "EXCL", "OTHER", Grouping))
+
+RHFB <- tbl(con, in_schema(schema_dflt, 'RHFB_SHIP2393')) %>% collect() %>% 
+  left_join(Groupings, by = c("hee_type1" = "type1"))
+
+exclusion1 <- start %>% inner_join(RHFB %>% transmute(scrssn) %>% distinct(),  by = "scrssn")
+
+exclusion2 <- load_parquet_safe("rhf_cohort_included.parquet") 
+
+exclusion2 <- exclusion2 %>% mutate(SCRSSN = scrssn)
+
+elig_rhf_data_assessment_final <- load_parquet_safe("elig_rhf_data_assessment_final.parquet")
+exclusion3 <- load_parquet_safe("elig_rhf_data_assessment_final_epis_excl.parquet")
+exclusion4 <- load_parquet_safe("elig_rhf_data_assessment_final_epis_excl1.parquet")
+exclusion5 <- load_parquet_safe("elig_rhf_data_assessment_final_epis_excl2.parquet")
+
+analysis_data <- load_parquet_safe("analysis_data.parquet")
+## Create Episode-Level Dataset
+
+# Arrange by patient, admission date, and episode run
+analysis_data <- analysis_data %>% 
+  arrange(SCRSSN, ADMSNDT, desc(episode_run)) %>%
+  group_by(SCRSSN, ADMSNDT) %>%
+  mutate(total_post_acute = max(episode_run) - 1) %>%
+  ungroup()
+
+## Create Patient-Level Dataset (One Episode Per Patient)
+# Take admission scores from earliest episode, discharge from latest
+admsn_vars <- names(analysis_data)[grepl("_ADMSN$", names(analysis_data))]
+
+analysis_data_final <- analysis_data %>%
+  group_by(SCRSSN, ADMSNDT) %>%
+  summarize(
+    across(all_of(admsn_vars), ~.[episode_run == min(episode_run)][[1]]),
+    across(!all_of(c(admsn_vars)), ~.[episode_run == max(episode_run)][[1]]),
+    .groups = "drop"
+  )
+
+# Identify patients with multiple hospitalizations
+patient_episode_counts <- analysis_data_final %>%
+  group_by(SCRSSN) %>%
+  summarise(n_episodes = n(), .groups = "drop")
+
+# Summary of multiple episodes
+cat("\nPatients with multiple episodes:\n")
+table(patient_episode_counts$n_episodes) %>% 
+  as.data.frame() %>%
+  setNames(c("Number of Episodes", "Number of Patients")) %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+
+# Randomly select one episode per patient
+set.seed(12345)
+exclusion6 <- analysis_data_final %>%
+  left_join(patient_episode_counts, by = "SCRSSN") %>%
+  group_by(SCRSSN) %>%
+  slice_sample(n = 1) %>%
+  ungroup()
+
+cat("\nPatient-level dataset created:", nrow(exclusion6), "unique patients\n")
+cat("Excluded episodes:", nrow(analysis_data_final) - nrow(exclusion6), "\n")
+
+# Functions:
+
+count_people_hosp <- function(df) {
+  list(
+    people = n_distinct(df$SCRSSN),
+    hospitalizations = df %>% distinct(SCRSSN, ADMSNDT) %>% nrow()
+  )
+}
+
+format_people_hosp <- function(people, hosp) {
+  paste0(format_big(people), " people, ", format_big(hosp), " hospitalizations")
+}
+
+diff_counts <- function(before, after) {
+  list(
+    people = before$people - after$people,
+    hospitalizations = before$hospitalizations - after$hospitalizations
+  )
+}
+
+build_exclusion_text <- function(people, hosp, reasons = NULL) {
+  main <- paste0("Excluded: ", format_people_hosp(people, hosp))
+  if (!is.null(reasons) && length(reasons) > 0) {
+    main <- paste0(main, " ", paste(reasons, collapse = "; "))
+  }
+  main
+}
+
+
+# Helper functions
+format_big <- function(x) {
+  format(x, big.mark = ",", scientific = FALSE)
+}
+
+
+# ===========================================================================
+# Count at each step
+# ==============================================================================
+
+step_counts_total <- rbind.data.frame(
+  count_people_hosp(start),
+  count_people_hosp(exclusion1),
+  count_people_hosp(exclusion2),
+  count_people_hosp(exclusion3),
+  count_people_hosp(exclusion4),
+  count_people_hosp(exclusion5),
+  count_people_hosp(exclusion6)
+)
+
+# Count at each step
+step_counts <- list(
+  A = count_people_hosp(start),
+  B = count_people_hosp(exclusion1),
+  C = count_people_hosp(exclusion2),
+  D = count_people_hosp(exclusion3),
+  E = count_people_hosp(exclusion4),
+  `F` = count_people_hosp(exclusion5),
+  G = count_people_hosp(exclusion6)
+)
+
+step_diffs <- list(
+  AB = diff_counts(step_counts$A, step_counts$B),
+  BC = diff_counts(step_counts$B, step_counts$C),
+  CD = diff_counts(step_counts$C, step_counts$D),
+  DE = diff_counts(step_counts$D, step_counts$E),
+  EF = diff_counts(step_counts$E, step_counts$`F`),
+  FG = diff_counts(step_counts$`F`, step_counts$G)
+)
+
+# Build exclusion text for each step
+stepA_exclusions <- build_exclusion_text(
+  step_diffs$AB$people, step_diffs$AB$hospitalizations, "Hospitalizations found in RHF data (any encounter)")
+
+stepB_exclusions <- build_exclusion_text(step_diffs$BC$people, step_diffs$BC$hospitalizations, "Hospitalizations with IRF/SNF discharge =3 days or HH =14 days")
+
+hosp_excl_flags <- elig_rhf_data_assessment_final %>% 
+  ungroup() %>%
+  mutate(los = coalesce(los_assess, los),
+         Too_Short = if_else(Grouping %in% c("SNF", "IRF", "HH") & los <= 3, 1L, 0L),
+         SNF_Over_99_Flag = if_else(Grouping == "SNF" & los >= 100, 1L, 0L)
+  ) %>%
+  mutate(Age_OB = if_else(Age_ADMSNDT > 99 | Age_ADMSNDT < 65, 1, 0)) %>%
+  group_by(SCRSSN, ADMSNDT, INP_hee_thru) %>%
+  mutate(
+    Too_Short_Only = min(Too_Short, na.rm = TRUE),
+    SNF_Over_99_Flag = max(SNF_Over_99_Flag, na.rm = TRUE)
+  ) %>% 
+  ungroup() %>% 
+  distinct() %>%
+  left_join(
+    elig_rhf %>% 
+      ungroup() %>% 
+      transmute(
+        SCRSSN = scrssn, 
+        INP_hee_thru, 
+        ADMSNDT, 
+        dod,
+        care_thru
+      ) %>% 
+      distinct(), 
+    by = c("SCRSSN", "ADMSNDT", "INP_hee_thru")
+  ) %>%
+  mutate(
+    final_thru = coalesce(exit_date, care_thru),
+    Died_1_Day = replace_na(if_else(ADMSNDT <= dod & final_thru + 1 >= dod, 1L, 0L), 0),
+    died = if_else(Died_1_Day == 1| died == 1, 1, 0),
+    Inpatient_Too_Long = if_else(as.numeric(INP_hee_thru - ADMSNDT) > 365, 1L, 0L),
+    excl_hosp = if_else(readmitted == 1 | Too_Short_Only == 1 | Age_OB == 1 |  Inpatient_Too_Long == 1 |  died == 1 | discharge_unpl == 1, 
+                        1, 0
+    )
+  ) 
+
+# Summarize flags by hospitalization:
+hosp_excl_summary <- hosp_excl_flags %>% 
+  dplyr::group_by(SCRSSN, ADMSNDT, INP_hee_thru) %>%
+  dplyr::summarize( 
+    excl_hosp = max(excl_hosp), 
+    readmitted = max(readmitted), 
+    Too_Short_Only= max(Too_Short_Only), 
+    Age_OB = max(Age_OB), 
+    Inpatient_Too_Long = max(Inpatient_Too_Long), 
+    died= max(died), , 
+    discharge_unpl= max(discharge_unpl)) %>%
+  ungroup()
+
+# Count each hospitalization-level exclusion reason
+hosp_excl_summary <- hosp_excl_summary %>%
+  dplyr::summarize(
+    total_excluded = sum(excl_hosp == 1, na.rm = TRUE),
+    n_readmitted = sum(readmitted == 1, na.rm = TRUE),
+    n_too_short = sum(Too_Short_Only == 1, na.rm = TRUE),
+    n_age_ob = sum(Age_OB == 1, na.rm = TRUE),
+    n_inp_too_long = sum(Inpatient_Too_Long == 1, na.rm = TRUE),
+    n_died = sum(died == 1, na.rm = TRUE),
+    n_unpl_disch = sum(discharge_unpl == 1, na.rm = TRUE)
+  )
+
+stepC_exclusion_reasons <- c(
+  paste0("Readmitted to acute care within 1 day: ", format_big(hosp_excl_summary$n_readmitted)),
+  paste0("Died on assessment: ", format_big(hosp_excl_summary$n_died)),
+  paste0("Unplanned discharge: ", format_big(hosp_excl_summary$n_unpl_disch)),
+  paste0("Episode ≤3 days (too short for rehab): ", format_big(hosp_excl_summary$n_too_short)),
+  paste0("Age >99 or <65: ", format_big(hosp_excl_summary$n_age_ob)),
+  paste0("Acute hospitalization >365 days: ", format_big(hosp_excl_summary$n_inp_too_long))
+)
+
+stepC_exclusions <- build_exclusion_text(
+  step_diffs$CD$people, step_diffs$CD$hospitalizations,
+  stepC_exclusion_reasons
+)
+
+# --- Step D→E: Episode-level exclusions Level 1 (detailed) ---
+# Reconstruct episode-level flags from elig_rhf_data_assessment_final_epis_excl
+epis_lv1_flags <- exclusion3 %>%
+  ungroup() %>%
+  mutate(
+    no_record = if_else(is.na(record_id_ADMSN) & is.na(record_id_DSCHRG), 1, 0),
+    IRF_VA_flag2 = if_else(IRF_VA_flag == 1 & no_record == 1, 1, 0),
+    excl_episode_lv1 = if_else(
+      no_record == 1 | HH_VA_flag == 1 | SNF_VA_flag == 1 | IRF_VA_flag2 == 1,
+      1, 0
+    )
+  ) %>% distinct()
+
+epis_lv1_summary <- epis_lv1_flags %>%
+  summarize(
+    total_excluded = sum(excl_episode_lv1 == 1, na.rm = TRUE),
+    n_no_record = sum(no_record == 1, na.rm = TRUE),
+    n_va_snf = sum(SNF_VA_flag == 1, na.rm = TRUE),
+    n_va_hh = sum(HH_VA_flag == 1, na.rm = TRUE),
+    n_va_irf_no_data = sum(IRF_VA_flag2 == 1, na.rm = TRUE)
+  )
+
+stepD_exclusion_reasons <- c(
+  paste0("No matched assessment record (no GG data): ", format_big(epis_lv1_summary$n_no_record)),
+  paste0("VA SNF with no external assessment data: ", format_big(epis_lv1_summary$n_va_snf)),
+  paste0("VA HH (purchased home health only): ", format_big(epis_lv1_summary$n_va_hh)),
+  paste0("VA IRF with no assessment data: ", format_big(epis_lv1_summary$n_va_irf_no_data))
+)
+
+stepD_exclusions <- build_exclusion_text(
+  step_diffs$DE$people, step_diffs$DE$hospitalizations,
+  stepD_exclusion_reasons
+)
+
+# --- Step E→F: Episode-level exclusions Level 2 (detailed) ---
+epis_lv2_flags <- exclusion4 %>%
+  ungroup() %>%
+  mutate(
+    no_valid_items = coalesce(
+      if_else(count_valid_ALL_ADMSN == 0 & count_valid_ALL_DSCHRG == 0, 1, 0), 0
+    )
+  )  %>% distinct()
+
+epis_lv2_summary <- epis_lv2_flags %>%
+  summarize(
+    n_no_valid = sum(no_valid_items == 1, na.rm = TRUE)
+  )
+
+stepE_exclusion_reasons <- c(
+  paste0("No GG items with a valid score (01-06): ", format_big(epis_lv2_summary$n_no_valid))
+)
+
+stepE_exclusions <- build_exclusion_text(
+  step_diffs$EF$people, step_diffs$EF$hospitalizations,
+  stepE_exclusion_reasons
+)
+
+# --- Step F→G: Patient-level selection ---
+stepF_exclusions <- build_exclusion_text(
+  step_diffs$FG$people, step_diffs$FG$hospitalizations,
+  c(paste0("Random selection: 1 episode per patient. ",
+           "Patients with multiple episodes: ",
+           sum(patient_episode_counts$n_episodes > 1)))
+)
+
+
+#step_counts %>% flextable::flextable()
+start <- data.frame(excl = "Hospitalizations with primary diagnosis of stroke")
+stepA <- data.frame(excl = stepA_exclusions)
+stepB <- data.frame(excl = stepB_exclusions)
+stepC <- data.frame(excl = stepC_exclusions)
+stepD <-  data.frame(excl = stepD_exclusions)
+stepE <- data.frame(excl = stepE_exclusions)
+stepF <- data.frame(excl = stepF_exclusions)
+
+
+excl <- rbind.data.frame(start, stepA, stepB, stepC, stepD, stepE, stepF)
+
+consortdf <- cbind(step_counts_total, excl) 
+consortdf %>% flextable::flextable() %>% flextable::autofit()
+
+```
+
+
+### Table Raw Data:
+
+```{r}
+analysis_data_patient <- load_parquet_safe("analysis_data_patient.parquet")
+
+# vars with missingness:
+# rurality, race, ethnicity, marital_status, adi_centered,
+# prior_cognition_score, prior_mobility_score, prior_self_care_score
+```
+
+
+## Imputation
+
+### Select variables for imputation and set methods:
+
+```{r}
+df <- analysis_data_patient
+
+logreg_vars  <- c("rurality", "ethnicity_category")
+polyreg_vars <- c("race_category", "marital_status")
+pmm_vars     <- c("prior_cognition_score", "prior_mobility_score", "prior_self_care_score", "adi")
+more_pmm_vars <- c("baseline_gg", "discharge_gg")
+
+complete_covars <- c("post_acute_setting", "calendar_year", "acute_icu", "acute_setting",
+                     "acute_stroke_severity", "stroke_type", "age", "Gender",
+                     "va_hospitalization", "va_primary_care_ever", "prior_year_hospitalization",
+                     "multiple_post_acute", "acute_los", "prior_year_kim_frailty",
+                     "prior_twoyear_charlson", "prior_twoyear_pdx_stroke")
+
+all_vars <- c(complete_covars,
+              "rurality", "race_category", "ethnicity_category", "marital_status",
+              pmm_vars, more_pmm_vars)
+
+df <- df %>% select(PatientICN, all_of(all_vars))
+```
+
+### Run imputation
+
+```{r run imputation, cache = T, eval=FALSE}
+initial_imp <- mice(df, maxit = 0)
+pred <- initial_imp$pred
+
+pred["rurality", ] <- c(0,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,0, 1,1,1, 1,1,1, 1,1,1)
+pred["race_category", ] <- c(0,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,1, 0,1,1, 1,1,1, 1,1,1)
+pred["ethnicity_category", ] <- c(0,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,1, 1,0,1, 1,1,1, 1,1,1)
+pred["marital_status", ] <- c(0,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,0, 1,1,1, 1,1,1)
+pred["prior_cognition_score", ] <- c(0,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,1, 0,1,1, 1,1,1)
+pred["prior_mobility_score", ] <- c(0,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,1, 1,0,1, 1,1,1)
+pred["prior_self_care_score", ] <- c(0,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,0, 1,1,1)
+pred["adi", ] <- c(0,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,1, 0,1,1)
+pred["baseline_gg", ]  <- c(0,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,1, 1,0,0)
+pred["discharge_gg", ] <- c(0,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,1, 1,1,0)
+
+meth <- initial_imp$method
+meth[] <- ""
+meth["rurality"]             <- "logreg"
+meth["ethnicity_category"]   <- "logreg"
+meth["race_category"]        <- "polyreg"
+meth["marital_status"]       <- "polyreg"
+meth["prior_cognition_score"] <- "pmm"
+meth["prior_mobility_score"]  <- "pmm"
+meth["prior_self_care_score"] <- "pmm"
+meth["adi"]                   <- "pmm"
+meth["baseline_gg"]           <- "pmm"
+meth["discharge_gg"]          <- "pmm"
+
+imputed_data <- mice(df, m = 20, maxit = 10, method = meth, pred = pred,
+                     seed = 124, printFlag = TRUE)
+
+```
+```{r save RDS, eval = F}
+imputed_data %>%saveRDS("data/imputed_data.dta")
+```
+
+
+```{r load/save imputed data}
+imputed_data <- readRDS("data/imputed_data.dta")
+```
+
+## Inspect imputed data
+
+### Density plot:
+
+```{r density plot}
+densityplot(imputed_data)
+```
+
+### Imputation diagnostics
+
+```{r load cms data}
+cms_gg_data <- load_parquet_safe("gg_dat.parquet")
+```
+
+```{r inspect imputed data, cache = T}
+preimp_dat  <- df %>% dplyr::select(-PatientICN)
+postimp_dat <- mice::complete(imputed_data, 10) %>% select(-PatientICN)
+cms_dat     <- df %>%
+  select(-baseline_gg, -discharge_gg) %>%
+  left_join(cms_gg_data, by = "PatientICN") %>%
+  select(-PatientICN)
+```
+
+```{r}
+preimp_dat$dataset  <- "Pre-imputation"
+postimp_dat$dataset <- "Post-imputation"
+cms_dat$dataset     <- "CMS-imputation"
+```
+
+### Check full data pre/post imputation
+
+```{r compare datasets, cache = T}
+combined <- rbind(preimp_dat, postimp_dat, cms_dat)
+combined$dataset <- factor(combined$dataset,
+                           levels = c("Pre-imputation", "Post-imputation", "CMS-imputation"))
+
+combined <- combined %>% mutate(
+  age_category = case_when(
+    age >= 65 & age < 70 ~ "65-69",
+    age >= 70 & age < 75 ~ "70-74",
+    age >= 75 & age < 80 ~ "75-79",
+    age >= 80 & age < 85 ~ "80-84",
+    age >= 85             ~ "85+",
+    TRUE ~ NA
+  )
+)
+
+table1(~race_category + ethnicity_category + marital_status + rurality + adi +
+         prior_cognition_score + prior_self_care_score + prior_mobility_score +
+         baseline_gg + discharge_gg | dataset,
+       data = combined, caption = "Imputed Analysis Data", overall = FALSE)
+```
+
+```{r compare-datasets-download, echo=FALSE}
+# Aggregated summary; no patient identifiers
+compare_agg <- combined %>%
+  group_by(dataset) %>%
+  summarise(
+    n                         = n(),
+    pct_missing_race          = round(mean(is.na(race_category))          * 100, 1),
+    pct_missing_ethnicity     = round(mean(is.na(ethnicity_category))     * 100, 1),
+    pct_missing_marital       = round(mean(is.na(marital_status))         * 100, 1),
+    pct_missing_rurality      = round(mean(is.na(rurality))               * 100, 1),
+    pct_missing_adi           = round(mean(is.na(adi))                    * 100, 1),
+    pct_missing_cognition     = round(mean(is.na(prior_cognition_score))  * 100, 1),
+    pct_missing_self_care     = round(mean(is.na(prior_self_care_score))  * 100, 1),
+    pct_missing_mobility      = round(mean(is.na(prior_mobility_score))   * 100, 1),
+    mean_baseline_gg          = round(mean(baseline_gg,  na.rm = TRUE), 2),
+    sd_baseline_gg            = round(sd(baseline_gg,    na.rm = TRUE), 2),
+    mean_discharge_gg         = round(mean(discharge_gg, na.rm = TRUE), 2),
+    sd_discharge_gg           = round(sd(discharge_gg,   na.rm = TRUE), 2),
+    .groups = "drop"
+  )
+
+compare_agg %>%
+  downloadthis::download_this(
+    output_name      = "compare_datasets_imputation_summary",
+    output_extension = ".xlsx",
+    button_label     = "Download comparison summary (xlsx)",
+    button_type      = "default",
+    class            = "btn-sm"
+  )
+```
+
+### Check discharge GG total score before after imputation by setting
+
+```{r discharge gg by dataset and post-acute setting}
+table1(~discharge_gg | dataset + post_acute_setting,
+       data = combined, caption = "Imputed Analysis Data", overall = FALSE)
+```
+
+```{r discharge-gg-setting-download, echo=FALSE}
+discharge_gg_agg <- combined %>%
+  group_by(dataset, post_acute_setting) %>%
+  summarise(
+    n                 = n(),
+    mean_discharge_gg = round(mean(discharge_gg, na.rm = TRUE), 2),
+    sd_discharge_gg   = round(sd(discharge_gg,   na.rm = TRUE), 2),
+    median_discharge_gg = round(median(discharge_gg, na.rm = TRUE), 2),
+    pct_missing       = round(mean(is.na(discharge_gg)) * 100, 1),
+    .groups = "drop"
+  )
+
+discharge_gg_agg %>%
+  downloadthis::download_this(
+    output_name      = "discharge_gg_by_dataset_and_setting",
+    output_extension = ".xlsx",
+    button_label     = "Download discharge GG summary (xlsx)",
+    button_type      = "default",
+    class            = "btn-sm"
+  )
+```
+
+### Visualize baseline and discharge GG scores, post-imputation
+
+```{r discharge hist post-imp}
+combined %>%
+  filter(dataset == "Post-imputation") %>%
+  ggplot(aes(x = discharge_gg)) +
+  geom_histogram(bins = 50, fill = "coral", color = "black", alpha = 0.75) +
+  labs(subtitle = "Discharge GG Score", x = "Score", y = "Frequency") +
+  facet_grid(cols = vars(dataset)) +
+  common_theme
+```
+
+### Visualize baseline GG scores by setting by year, post-imputation
+
+```{r baseline scores}
+combined %>%
+  filter(dataset %in% c("Post-imputation")) %>%
+  group_by(dataset, calendar_year, post_acute_setting) %>%
+  summarise(
+    mean_val = mean(baseline_gg, na.rm = TRUE),
+    se_val   = sd(baseline_gg,   na.rm = TRUE) / sqrt(n()),
+    .groups  = "drop"
+  ) %>%
+  ggplot(aes(x = calendar_year, y = mean_val,
+             color = post_acute_setting, group = post_acute_setting)) +
+  geom_line(size = 1) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = mean_val - se_val, ymax = mean_val + se_val), width = 0.2) +
+  labs(title = "Baseline (Admission) GG Score by Year",
+       x = "Calendar Year", y = "Mean Score", color = "Initial Discharge") +
+  facet_grid(cols = vars(dataset)) +
+  common_theme +
+  theme(legend.position = "bottom")
+```
+
+### Visualize discharge GG scores by setting by year, post-imputation
+
+```{r discharge by year}
+combined %>%
+  filter(dataset %in% c("Post-imputation")) %>%
+  group_by(dataset, calendar_year, post_acute_setting) %>%
+  summarise(
+    mean_val = mean(discharge_gg, na.rm = TRUE),
+    se_val   = sd(discharge_gg,   na.rm = TRUE) / sqrt(n()),
+    .groups  = "drop"
+  ) %>%
+  ggplot(aes(x = calendar_year, y = mean_val,
+             color = post_acute_setting, group = post_acute_setting)) +
+  geom_line(size = 1) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = mean_val - se_val, ymax = mean_val + se_val), width = 0.2) +
+  labs(title = "Discharge GG Score by Year",
+       x = "Calendar Year", y = "Mean Score", color = "Initial Discharge") +
+  facet_grid(cols = vars(dataset)) +
+  common_theme +
+  theme(legend.position = "bottom")
+```
+
+## Subgroup Figures
+
+```{r prepare figure data}
+fig_base <- combined %>%
+  filter(dataset == "Post-imputation") %>%
+  mutate(
+    frailty_cat = factor(case_when(
+      prior_year_kim_frailty < 0.15                                          ~ "Robust (below 0.15)",
+      prior_year_kim_frailty >= 0.15 & prior_year_kim_frailty < 0.25        ~ "Prefrail (0.15-0.24)",
+      prior_year_kim_frailty >= 0.25 & prior_year_kim_frailty < 0.35        ~ "Mildly Frail (0.25-0.34)",
+      prior_year_kim_frailty >= 0.35                                         ~ "Moderate to Severely Frail (0.35 and above)"
+    ), levels = c("Robust (below 0.15)", "Prefrail (0.15-0.24)",
+                  "Mildly Frail (0.25-0.34)", "Moderate to Severely Frail (0.35 and above)")),
+
+    prior_cognition_label = factor(case_when(
+      prior_cognition_score == 1 ~ "Dependent",
+      prior_cognition_score == 2 ~ "Some Assistance",
+      prior_cognition_score == 3 ~ "Independent"
+    ), levels = c("Dependent", "Some Assistance", "Independent")),
+
+    prior_self_care_label = factor(case_when(
+      prior_self_care_score == 1 ~ "Dependent",
+      prior_self_care_score == 2 ~ "Some Assistance",
+      prior_self_care_score == 3 ~ "Independent"
+    ), levels = c("Dependent", "Some Assistance", "Independent")),
+
+    prior_mobility_label = factor(case_when(
+      prior_mobility_score == 1 ~ "Dependent",
+      prior_mobility_score == 2 ~ "Some Assistance",
+      prior_mobility_score == 3 ~ "Independent"
+    ), levels = c("Dependent", "Some Assistance", "Independent"))
+  )
+
+fig_long <- fig_base %>%
+  pivot_longer(cols = c(baseline_gg, discharge_gg),
+               names_to = "timepoint", values_to = "gg_score") %>%
+  mutate(timepoint = factor(
+    if_else(timepoint == "baseline_gg", "Admission", "Discharge"),
+    levels = c("Admission", "Discharge")
+  ))
+
+summarize_gg <- function(data, group_var) {
+  data %>%
+    group_by(timepoint, .data[[group_var]]) %>%
+    summarise(
+      mean_val = mean(gg_score, na.rm = TRUE),
+      se_val   = sd(gg_score,   na.rm = TRUE) / sqrt(n()),
+      .groups  = "drop"
+    ) %>%
+    rename(group = .data[[group_var]])
+}
+```
+
+## Descriptive Tables by Setting and Frailty Level
+
+### Table 1: N (%) by Post-Acute Setting and Frailty Level (row %)
+
+```{r table-n-pct-frailty}
+tbl_n_row <- fig_base %>%
+  filter(!is.na(frailty_cat), !is.na(post_acute_setting)) %>%
+  count(post_acute_setting, frailty_cat) %>%
+  group_by(post_acute_setting) %>%
+  mutate(
+    row_total = sum(n),
+    pct       = round(100 * n / row_total, 1),
+    cell      = paste0(n, " (", pct, "%)")
+  ) %>%
+  ungroup() %>%
+  select(post_acute_setting, frailty_cat, cell) %>%
+  pivot_wider(names_from = frailty_cat, values_from = cell) %>%
+  rename(`Post-Acute Setting` = post_acute_setting)
+
+tbl_n_row %>%
+  gt() %>%
+  tab_header(
+    title    = "Table 1. N (%) by Post-Acute Setting and Frailty Level",
+    subtitle = "Row percentages (% within setting); post-imputation data"
+  ) %>%
+  tab_style(style = cell_text(weight = "bold"), locations = cells_column_labels()) %>%
+  tab_options(table.font.size = 13, table.width = pct(100))
+```
+
+```{r table1-row-download, echo=FALSE}
+tbl_n_row %>%
+  downloadthis::download_this(
+    output_name      = "Table1_N_pct_setting_frailty_rowwise",
+    output_extension = ".xlsx",
+    button_label     = "Download Table 1 (row %) data (xlsx)",
+    button_type      = "default",
+    class            = "btn-sm"
+  )
+```
+
+### Table 1 (column %): N (%) by Post-Acute Setting and Frailty Level
+
+```{r table-n-pct-frailty-columnwise}
+tbl_n_col <- fig_base %>%
+  filter(!is.na(frailty_cat), !is.na(post_acute_setting)) %>%
+  count(post_acute_setting, frailty_cat) %>%
+  group_by(frailty_cat) %>%
+  mutate(
+    col_total = sum(n),
+    pct       = round(100 * n / col_total, 1),
+    cell      = paste0(n, " (", pct, "%)")
+  ) %>%
+  ungroup() %>%
+  select(post_acute_setting, frailty_cat, cell) %>%
+  pivot_wider(names_from = frailty_cat, values_from = cell) %>%
+  rename(`Post-Acute Setting` = post_acute_setting)
+
+tbl_n_col %>%
+  gt() %>%
+  tab_header(
+    title    = "Table 1. N (%) by Post-Acute Setting and Frailty Level",
+    subtitle = "Column percentages (% within category); post-imputation data"
+  ) %>%
+  tab_style(style = cell_text(weight = "bold"), locations = cells_column_labels()) %>%
+  tab_options(table.font.size = 13, table.width = pct(100))
+```
+
+```{r table1-col-download, echo=FALSE}
+tbl_n_col %>%
+  downloadthis::download_this(
+    output_name      = "Table1_N_pct_setting_frailty_colwise",
+    output_extension = ".xlsx",
+    button_label     = "Download Table 1 (col %) data (xlsx)",
+    button_type      = "default",
+    class            = "btn-sm"
+  )
+```
+
+### Table 2: Mean (SD) Discharge GG Score by Post-Acute Setting and Frailty Level
+
+```{r table-mean-sd-frailty}
+tbl_mean <- fig_base %>%
+  filter(!is.na(frailty_cat), !is.na(post_acute_setting)) %>%
+  group_by(post_acute_setting, frailty_cat) %>%
+  summarise(
+    mean_sd = paste0(
+      round(mean(discharge_gg, na.rm = TRUE), 1),
+      " (", round(sd(discharge_gg, na.rm = TRUE), 1), ")"
+    ),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(names_from = frailty_cat, values_from = mean_sd) %>%
+  rename(`Post-Acute Setting` = post_acute_setting)
+
+tbl_mean %>%
+  gt() %>%
+  tab_header(
+    title    = "Table 2. Mean (SD) Discharge GG Score by Post-Acute Setting and Frailty Level",
+    subtitle = "Post-imputation data"
+  ) %>%
+  tab_style(style = cell_text(weight = "bold"), locations = cells_column_labels()) %>%
+  tab_options(table.font.size = 13, table.width = pct(100))
+```
+
+```{r table2-download, echo=FALSE}
+# Underlying long-format data (no identifiers)
+tbl_mean_underlying <- fig_base %>%
+  filter(!is.na(frailty_cat), !is.na(post_acute_setting)) %>%
+  group_by(post_acute_setting, frailty_cat) %>%
+  summarise(
+    n                 = n(),
+    mean_discharge_gg = round(mean(discharge_gg, na.rm = TRUE), 3),
+    sd_discharge_gg   = round(sd(discharge_gg,   na.rm = TRUE), 3),
+    .groups           = "drop"
+  )
+
+tbl_mean_underlying %>%
+  downloadthis::download_this(
+    output_name      = "Table2_mean_sd_discharge_gg_setting_frailty",
+    output_extension = ".xlsx",
+    button_label     = "Download Table 2 data (xlsx)",
+    button_type      = "default",
+    class            = "btn-sm"
+  )
+```
+
+### Figure 1: GG Score by Initial Discharge Location
+
+```{r fig1 gg by discharge location, fig.width=8, fig.height=6}
+fig1_data <- summarize_gg(fig_long, "post_acute_setting")
+
+ggplot(fig1_data, aes(x = timepoint, y = mean_val, color = group, group = group)) +
+  geom_point(size = 3) +
+  geom_line(linewidth = 1) +
+  geom_errorbar(aes(ymin = mean_val - se_val, ymax = mean_val + se_val), width = 0.25) +
+  common_y +
+  scale_color_npg(name = "Discharge Location") +
+  labs(x = "Time", y = "Total GG Score") +
+  common_theme
+```
+
+### Figure 2: GG Score by Race
+
+```{r fig2 gg by race, fig.width=8, fig.height=6}
+fig2_data <- fig_long %>%
+  filter(!is.na(race_category)) %>%
+  group_by(timepoint, race_category) %>%
+  summarise(
+    mean_val = mean(gg_score, na.rm = TRUE),
+    se_val   = sd(gg_score,   na.rm = TRUE) / sqrt(n()),
+    .groups  = "drop"
+  )
+
+ggplot(fig2_data, aes(x = timepoint, y = mean_val,
+                      color = race_category, group = race_category)) +
+  geom_point(size = 3, position = position_dodge(width = 0.2)) +
+  geom_line(linewidth = 1, position = position_dodge(width = 0.2)) +
+  geom_errorbar(aes(ymin = mean_val - se_val, ymax = mean_val + se_val),
+                width = 0.25, position = position_dodge(width = 0.2)) +
+  common_y +
+  scale_color_npg(name = "Race") +
+  labs(x = "Time", y = "Total GG Score") +
+  common_theme
+```
+
+### Figure 3: GG Score by KIM Frailty
+
+```{r fig3 gg by frailty, fig.width=9, fig.height=6}
+fig3_data <- fig_long %>%
+  filter(!is.na(frailty_cat)) %>%
+  group_by(timepoint, frailty_cat) %>%
+  summarise(
+    mean_val = mean(gg_score, na.rm = TRUE),
+    se_val   = sd(gg_score,   na.rm = TRUE) / sqrt(n()),
+    .groups  = "drop"
+  )
+
+ggplot(fig3_data, aes(x = timepoint, y = mean_val,
+                      color = frailty_cat, group = frailty_cat)) +
+  geom_point(size = 3) +
+  geom_line(linewidth = 1) +
+  geom_errorbar(aes(ymin = mean_val - se_val, ymax = mean_val + se_val), width = 0.25) +
+  common_y +
+  scale_color_npg(name = "KIM Frailty") +
+  labs(x = "Time", y = "Total GG Score") +
+  common_theme
+```
+
+### Figure 4: GG Score by Prior Cognition
+
+```{r fig4 gg by prior cognition, fig.width=8, fig.height=6}
+fig4_data <- fig_long %>%
+  filter(!is.na(prior_cognition_label)) %>%
+  group_by(timepoint, prior_cognition_label) %>%
+  summarise(
+    mean_val = mean(gg_score, na.rm = TRUE),
+    se_val   = sd(gg_score,   na.rm = TRUE) / sqrt(n()),
+    .groups  = "drop"
+  )
+
+ggplot(fig4_data, aes(x = timepoint, y = mean_val,
+                      color = prior_cognition_label, group = prior_cognition_label)) +
+  geom_point(size = 3) +
+  geom_line(linewidth = 1) +
+  geom_errorbar(aes(ymin = mean_val - se_val, ymax = mean_val + se_val), width = 0.25) +
+  common_y +
+  scale_color_npg(name = "Prior Cognition") +
+  labs(x = "Time", y = "Total GG Score") +
+  common_theme
+```
+
+### Figure 5: GG Score by Prior ADL (Self-Care)
+
+```{r fig5 gg by prior adl, fig.width=8, fig.height=6}
+fig5_data <- fig_long %>%
+  filter(!is.na(prior_self_care_label)) %>%
+  group_by(timepoint, prior_self_care_label) %>%
+  summarise(
+    mean_val = mean(gg_score, na.rm = TRUE),
+    se_val   = sd(gg_score,   na.rm = TRUE) / sqrt(n()),
+    .groups  = "drop"
+  )
+
+ggplot(fig5_data, aes(x = timepoint, y = mean_val,
+                      color = prior_self_care_label, group = prior_self_care_label)) +
+  geom_point(size = 3) +
+  geom_line(linewidth = 1) +
+  geom_errorbar(aes(ymin = mean_val - se_val, ymax = mean_val + se_val), width = 0.25) +
+  common_y +
+  scale_color_npg(name = "Prior ADL") +
+  labs(x = "Time", y = "Total GG Score") +
+  common_theme
+```
+
+### Figure 6: GG Score by Prior Mobility
+
+```{r fig6 gg by prior mobility, fig.width=8, fig.height=6}
+fig6_data <- fig_long %>%
+  filter(!is.na(prior_mobility_label)) %>%
+  group_by(timepoint, prior_mobility_label) %>%
+  summarise(
+    mean_val = mean(gg_score, na.rm = TRUE),
+    se_val   = sd(gg_score,   na.rm = TRUE) / sqrt(n()),
+    .groups  = "drop"
+  )
+
+ggplot(fig6_data, aes(x = timepoint, y = mean_val,
+                      color = prior_mobility_label, group = prior_mobility_label)) +
+  geom_point(size = 3) +
+  geom_line(linewidth = 1) +
+  geom_errorbar(aes(ymin = mean_val - se_val, ymax = mean_val + se_val), width = 0.25) +
+  common_y +
+  scale_color_npg(name = "Prior Mobility") +
+  labs(x = "Time", y = "Total GG Score") +
+  common_theme
+```
+
+
+## Two-Part (Logistic + OLS) - Full Model
+
+```{r run pooled models pt1}
+model_part_1 <- with(imputed_data, {
+  at_ceiling <- if_else(discharge_gg == 60, 1, 0)
+  glm(at_ceiling ~ post_acute_setting + baseline_gg + acute_los +
+        acute_stroke_severity + rurality + calendar_year + race_category +
+        ethnicity_category + age + Gender + marital_status + va_hospitalization +
+        stroke_type + adi + multiple_post_acute +
+        prior_cognition_score + prior_mobility_score + prior_self_care_score +
+        prior_year_kim_frailty + prior_twoyear_charlson + prior_twoyear_pdx_stroke +
+        (prior_year_kim_frailty * post_acute_setting),
+      family = binomial(link = "logit"))
+})
+```
+
+```{r run pooled models pt2}
+imp_NA <- imputed_data %>%
+  mice::complete(action = "long", include = TRUE) %>%
+  mutate(NA_discharge_gg = if_else(discharge_gg == 60, NA, discharge_gg))
+
+imp_NA <- as.mids(imp_NA)
+
+model_part_2 <- with(data = imp_NA, expr = {
+  lm(NA_discharge_gg ~ post_acute_setting + baseline_gg + acute_los +
+       acute_stroke_severity + rurality + calendar_year + race_category +
+       ethnicity_category + age + Gender + marital_status + va_hospitalization +
+       stroke_type + adi + multiple_post_acute +
+       prior_cognition_score + prior_mobility_score + prior_self_care_score +
+       prior_year_kim_frailty + prior_twoyear_charlson + prior_twoyear_pdx_stroke +
+       (prior_year_kim_frailty * post_acute_setting))
+})
+```
+
+### Exhibit 1a. Logistic regression of ceiling value (log-odds)
+
+```{r part 1 model results}
+pooled_full_pt1 <- pool(model_part_1)
+coef_tbl_1a <- summary(pooled_full_pt1, conf.int = TRUE) %>%
+  select(-conf.low, -conf.high)
+coef_tbl_1a %>% kable(digits = 3)
+```
+
+```{r exhibit1a-download, echo=FALSE}
+summary(pooled_full_pt1, conf.int = TRUE) %>%
+  downloadthis::download_this(
+    output_name      = "Exhibit1a_logistic_log_odds",
+    output_extension = ".xlsx",
+    button_label     = "Download Exhibit 1a data (xlsx)",
+    button_type      = "default",
+    class            = "btn-sm"
+  )
+```
+
+### Exhibit 1b. Logistic regression of ceiling value (odds ratio)
+
+```{r part 1 model results OR}
+pooled_full_pt1 <- pool(model_part_1)
+coef_tbl_1b <- summary(pooled_full_pt1, conf.int = TRUE, exponentiate = TRUE) %>%
+  select(-conf.low, -conf.high) %>%
+  rename(OR = estimate)
+coef_tbl_1b %>% kable(digits = 3)
+```
+
+```{r exhibit1b-download, echo=FALSE}
+summary(pooled_full_pt1, conf.int = TRUE, exponentiate = TRUE) %>%
+  rename(OR = estimate) %>%
+  downloadthis::download_this(
+    output_name      = "Exhibit1b_logistic_odds_ratios",
+    output_extension = ".xlsx",
+    button_label     = "Download Exhibit 1b data (xlsx)",
+    button_type      = "default",
+    class            = "btn-sm"
+  )
+```
+
+### Exhibit 2. OLS on distribution below 60
+
+```{r exhibit2-ols}
+pooled_full_pt2 <- pool(model_part_2)
+coef_tbl_2 <- summary(pooled_full_pt2, conf.int = TRUE) %>%
+  select(-conf.low, -conf.high)
+coef_tbl_2 %>% kable(digits = 3)
+```
+
+```{r exhibit2-download, echo=FALSE}
+summary(pooled_full_pt2, conf.int = TRUE) %>%
+  downloadthis::download_this(
+    output_name      = "Exhibit2_OLS_below60",
+    output_extension = ".xlsx",
+    button_label     = "Download Exhibit 2 data (xlsx)",
+    button_type      = "default",
+    class            = "btn-sm"
+  )
+```
+
+
+## CMS Imputation Method Sensitivity Analysis
+
+```{r cms method run pooled models pt1}
+model_part_1_cms <- with(cms_dat, {
+  at_ceiling <- if_else(discharge_gg == 60, 1, 0)
+  glm(at_ceiling ~ post_acute_setting + baseline_gg + acute_los +
+        acute_stroke_severity + rurality + calendar_year + race_category +
+        ethnicity_category + age + Gender + marital_status + va_hospitalization +
+        stroke_type + adi + multiple_post_acute +
+        prior_cognition_score + prior_mobility_score + prior_self_care_score +
+        prior_year_kim_frailty + prior_twoyear_charlson + prior_twoyear_pdx_stroke +
+        (prior_year_kim_frailty * post_acute_setting),
+      family = binomial(link = "logit"))
+})
+```
+
+```{r cms method run pooled models pt2}
+cms_dat_filtered <- cms_dat %>% filter(discharge_gg < 60)
+
+model_part_2_cms <- with(cms_dat_filtered, {
+  lm(discharge_gg ~ post_acute_setting + baseline_gg + acute_los +
+       acute_stroke_severity + rurality + calendar_year + race_category +
+       ethnicity_category + age + Gender + marital_status + va_hospitalization +
+       stroke_type + adi + multiple_post_acute +
+       prior_cognition_score + prior_mobility_score + prior_self_care_score +
+       prior_year_kim_frailty + prior_twoyear_charlson + prior_twoyear_pdx_stroke +
+       (prior_year_kim_frailty * post_acute_setting))
+})
+```
+
+### Exhibit 3. Logistic regression of ceiling value (CMS, including OR)
+
+```{r cms method part 1 model results OR}
+coef_tbl_3 <- broom::tidy(model_part_1_cms, conf.int = FALSE) %>%
+  mutate(
+    conf.low  = estimate - 1.96 * std.error,
+    conf.high = estimate + 1.96 * std.error,
+    OR        = exp(estimate),
+    OR_low    = exp(conf.low),
+    OR_high   = exp(conf.high)
+  ) %>%
+  dplyr::select(term, estimate, std.error, statistic, conf.low, conf.high,
+                OR, OR_low, OR_high, p.value)
+
+coef_tbl_3 %>% kable(digits = 3)
+```
+
+```{r exhibit3-download, echo=FALSE}
+coef_tbl_3 %>%
+  downloadthis::download_this(
+    output_name      = "Exhibit3_CMS_logistic_OR",
+    output_extension = ".xlsx",
+    button_label     = "Download Exhibit 3 data (xlsx)",
+    button_type      = "default",
+    class            = "btn-sm"
+  )
+```
+
+### Exhibit 4. OLS on distribution below 60 (CMS)
+
+```{r cms method part 2 model results}
+coef_tbl_4 <- broom::tidy(model_part_2_cms, conf.int = FALSE) %>%
+  mutate(
+    conf.low  = estimate - 1.96 * std.error,
+    conf.high = estimate + 1.96 * std.error
+  ) %>%
+  dplyr::select(term, estimate, std.error, statistic, conf.low, conf.high, p.value)
+
+coef_tbl_4 %>% kable(digits = 3)
+```
+
+```{r exhibit4-download, echo=FALSE}
+coef_tbl_4 %>%
+  downloadthis::download_this(
+    output_name      = "Exhibit4_CMS_OLS_below60",
+    output_extension = ".xlsx",
+    button_label     = "Download Exhibit 4 data (xlsx)",
+    button_type      = "default",
+    class            = "btn-sm"
+  )
+```
+
+
+## Collected Data (Complete-Case) Sensitivity Analysis
+
+These models use collected (non-imputed) GG scores with listwise deletion for any missing
+covariates, as a sensitivity analysis alongside the CMS and multiple imputation approaches.
+
+```{r collected-data-setup}
+collected_dat <- analysis_data_patient %>%
+  select(
+    post_acute_setting, baseline_gg, discharge_gg, acute_los,
+    acute_stroke_severity, rurality, calendar_year, race_category,
+    ethnicity_category, age, Gender, marital_status, va_hospitalization,
+    stroke_type, adi, multiple_post_acute,
+    prior_cognition_score, prior_mobility_score, prior_self_care_score,
+    prior_year_kim_frailty, prior_twoyear_charlson, prior_twoyear_pdx_stroke
+  )
+
+collected_dat_below60 <- collected_dat %>% filter(discharge_gg < 60)
+
+collected_dat_cs <- collected_dat %>%
+  mutate(gg_change = discharge_gg - baseline_gg)
+
+cat("Complete-case N available (Part 1):", sum(complete.cases(collected_dat)), "\n")
+cat("Complete-case N (Part 2, discharge_gg < 60):", sum(complete.cases(collected_dat_below60)), "\n")
+```
+
+```{r collected-pt1-logistic}
+model_part_1_collected <- glm(
+  I(discharge_gg == 60) ~ post_acute_setting + baseline_gg + acute_los +
+    acute_stroke_severity + rurality + calendar_year + race_category +
+    ethnicity_category + age + Gender + marital_status + va_hospitalization +
+    stroke_type + adi + multiple_post_acute +
+    prior_cognition_score + prior_mobility_score + prior_self_care_score +
+    prior_year_kim_frailty + prior_twoyear_charlson + prior_twoyear_pdx_stroke +
+    (prior_year_kim_frailty * post_acute_setting),
+  family    = binomial(link = "logit"),
+  data      = collected_dat,
+  na.action = na.omit
+)
+```
+
+```{r collected-pt2-ols}
+model_part_2_collected <- lm(
+  discharge_gg ~ post_acute_setting + baseline_gg + acute_los +
+    acute_stroke_severity + rurality + calendar_year + race_category +
+    ethnicity_category + age + Gender + marital_status + va_hospitalization +
+    stroke_type + adi + multiple_post_acute +
+    prior_cognition_score + prior_mobility_score + prior_self_care_score +
+    prior_year_kim_frailty + prior_twoyear_charlson + prior_twoyear_pdx_stroke +
+    (prior_year_kim_frailty * post_acute_setting),
+  data      = collected_dat_below60,
+  na.action = na.omit
+)
+```
+
+```{r collected-cs-with-baseline}
+model_cs_with_baseline_collected <- lm(
+  gg_change ~ post_acute_setting + baseline_gg + acute_los +
+    acute_stroke_severity + rurality + calendar_year + race_category +
+    ethnicity_category + age + Gender + marital_status + va_hospitalization +
+    stroke_type + adi + multiple_post_acute +
+    prior_cognition_score + prior_mobility_score + prior_self_care_score +
+    prior_year_kim_frailty + prior_twoyear_charlson + prior_twoyear_pdx_stroke +
+    (prior_year_kim_frailty * post_acute_setting),
+  data      = collected_dat_cs,
+  na.action = na.omit
+)
+```
+
+```{r collected-cs-no-baseline}
+model_cs_no_baseline_collected <- lm(
+  gg_change ~ post_acute_setting + acute_los +
+    acute_stroke_severity + rurality + calendar_year + race_category +
+    ethnicity_category + age + Gender + marital_status + va_hospitalization +
+    stroke_type + adi + multiple_post_acute +
+    prior_cognition_score + prior_mobility_score + prior_self_care_score +
+    prior_year_kim_frailty + prior_twoyear_charlson + prior_twoyear_pdx_stroke +
+    (prior_year_kim_frailty * post_acute_setting),
+  data      = collected_dat_cs,
+  na.action = na.omit
+)
+```
+
+### Exhibit 7. Logistic Regression of Ceiling Value: Collected Data (OR)
+
+```{r exhibit7-collected-logistic}
+coef_tbl_7 <- broom::tidy(model_part_1_collected, conf.int = FALSE) %>%
+  mutate(
+    conf.low  = estimate - 1.96 * std.error,
+    conf.high = estimate + 1.96 * std.error,
+    OR        = exp(estimate),
+    OR_low    = exp(conf.low),
+    OR_high   = exp(conf.high)
+  ) %>%
+  dplyr::select(term, estimate, std.error, statistic, conf.low, conf.high,
+                OR, OR_low, OR_high, p.value)
+
+coef_tbl_7 %>% kable(digits = 3)
+```
+
+```{r exhibit7-download, echo=FALSE}
+coef_tbl_7 %>%
+  downloadthis::download_this(
+    output_name      = "Exhibit7_collected_logistic_OR",
+    output_extension = ".xlsx",
+    button_label     = "Download Exhibit 7 data (xlsx)",
+    button_type      = "default",
+    class            = "btn-sm"
+  )
+```
+
+### Exhibit 8. OLS on Distribution Below 60: Collected Data
+
+```{r exhibit8-collected-ols}
+coef_tbl_8 <- broom::tidy(model_part_2_collected, conf.int = FALSE) %>%
+  mutate(
+    conf.low  = estimate - 1.96 * std.error,
+    conf.high = estimate + 1.96 * std.error
+  ) %>%
+  dplyr::select(term, estimate, std.error, statistic, conf.low, conf.high, p.value)
+
+coef_tbl_8 %>% kable(digits = 3)
+```
+
+```{r exhibit8-download, echo=FALSE}
+coef_tbl_8 %>%
+  downloadthis::download_this(
+    output_name      = "Exhibit8_collected_OLS_below60",
+    output_extension = ".xlsx",
+    button_label     = "Download Exhibit 8 data (xlsx)",
+    button_type      = "default",
+    class            = "btn-sm"
+  )
+```
+
+### Exhibit 9. Change Score OLS (With Baseline): Collected Data
+
+```{r exhibit9-collected-cs-baseline}
+coef_tbl_9 <- broom::tidy(model_cs_with_baseline_collected, conf.int = FALSE) %>%
+  mutate(
+    conf.low  = estimate - 1.96 * std.error,
+    conf.high = estimate + 1.96 * std.error
+  ) %>%
+  dplyr::select(term, estimate, std.error, statistic, conf.low, conf.high, p.value)
+
+coef_tbl_9 %>% kable(digits = 3)
+```
+
+```{r exhibit9-download, echo=FALSE}
+coef_tbl_9 %>%
+  downloadthis::download_this(
+    output_name      = "Exhibit9_collected_change_score_with_baseline",
+    output_extension = ".xlsx",
+    button_label     = "Download Exhibit 9 data (xlsx)",
+    button_type      = "default",
+    class            = "btn-sm"
+  )
+```
+
+### Exhibit 10. Change Score OLS (No Baseline): Collected Data
+
+```{r exhibit10-collected-cs-no-baseline}
+coef_tbl_10 <- broom::tidy(model_cs_no_baseline_collected, conf.int = FALSE) %>%
+  mutate(
+    conf.low  = estimate - 1.96 * std.error,
+    conf.high = estimate + 1.96 * std.error
+  ) %>%
+  dplyr::select(term, estimate, std.error, statistic, conf.low, conf.high, p.value)
+
+coef_tbl_10 %>% kable(digits = 3)
+```
+
+```{r exhibit10-download, echo=FALSE}
+coef_tbl_10 %>%
+  downloadthis::download_this(
+    output_name      = "Exhibit10_collected_change_score_no_baseline",
+    output_extension = ".xlsx",
+    button_label     = "Download Exhibit 10 data (xlsx)",
+    button_type      = "default",
+    class            = "btn-sm"
+  )
+```
+
+
+## Change Score OLS - Full Model
+
+```{r run pooled models pt2 change score}
+model_cs_with_baseline <- with(imputed_data, {
+  gg_change <- discharge_gg - baseline_gg
+  lm(gg_change ~ post_acute_setting + baseline_gg + acute_los +
+       acute_stroke_severity + rurality + calendar_year + race_category +
+       ethnicity_category + age + Gender + marital_status + va_hospitalization +
+       stroke_type + adi + multiple_post_acute +
+       prior_cognition_score + prior_mobility_score + prior_self_care_score +
+       prior_year_kim_frailty + prior_twoyear_charlson + prior_twoyear_pdx_stroke +
+       (prior_year_kim_frailty * post_acute_setting))
+})
+```
+
+```{r run pooled models pt2 change score no baseline}
+model_cs_no_baseline <- with(imputed_data, {
+  gg_change <- discharge_gg - baseline_gg
+  lm(gg_change ~ post_acute_setting + acute_los +
+       acute_stroke_severity + rurality + calendar_year + race_category +
+       ethnicity_category + age + Gender + marital_status + va_hospitalization +
+       stroke_type + adi + multiple_post_acute +
+       prior_cognition_score + prior_mobility_score + prior_self_care_score +
+       prior_year_kim_frailty + prior_twoyear_charlson + prior_twoyear_pdx_stroke +
+       (prior_year_kim_frailty * post_acute_setting))
+})
+```
+
+### Exhibit 5. OLS of change score (with baseline)
+
+```{r part 2 model results change score}
+pooled_model_cs <- pool(model_cs_with_baseline)
+coef_tbl_5 <- summary(pooled_model_cs, conf.int = TRUE) %>%
+  select(-conf.low, -conf.high)
+coef_tbl_5 %>% kable(digits = 3)
+```
+
+```{r exhibit5-download, echo=FALSE}
+summary(pooled_model_cs, conf.int = TRUE) %>%
+  downloadthis::download_this(
+    output_name      = "Exhibit5_change_score_with_baseline",
+    output_extension = ".xlsx",
+    button_label     = "Download Exhibit 5 data (xlsx)",
+    button_type      = "default",
+    class            = "btn-sm"
+  )
+```
+
+### Exhibit 6. OLS of change score (no baseline)
+
+```{r part 2 model results change score no baseline}
+pooled_model_cs_nb <- pool(model_cs_no_baseline)
+coef_tbl_6 <- summary(pooled_model_cs_nb, conf.int = TRUE) %>%
+  select(-conf.low, -conf.high)
+coef_tbl_6 %>% kable(digits = 3)
+```
+
+```{r exhibit6-download, echo=FALSE}
+summary(pooled_model_cs_nb, conf.int = TRUE) %>%
+  downloadthis::download_this(
+    output_name      = "Exhibit6_change_score_no_baseline",
+    output_extension = ".xlsx",
+    button_label     = "Download Exhibit 6 data (xlsx)",
+    button_type      = "default",
+    class            = "btn-sm"
+  )
+```
+
+
+## Supplement: Missing GG Score Figures
+
+```{r}
+analysis_data_patient_item <- analysis_data_patient %>%
+  select(
+    PatientICN, post_acute_setting,
+    gg_val_GG0130A_ADMSN, gg_val_GG0130B_ADMSN, gg_val_GG0130C_ADMSN,
+    gg_val_GG0170A_ADMSN, gg_val_GG0170B_ADMSN, gg_val_GG0170C_ADMSN,
+    gg_val_GG0170D_ADMSN, gg_val_GG0170E_ADMSN, gg_val_GG0170F_ADMSN,
+    gg_val_GG0170I_ADMSN, gg_val_GG0170J_ADMSN, gg_val_GG0170R_ADMSN,
+    gg_val_GG0170S_ADMSN,
+    gg_val_GG0130A_DSCHRG, gg_val_GG0130B_DSCHRG, gg_val_GG0130C_DSCHRG,
+    gg_val_GG0170A_DSCHRG, gg_val_GG0170B_DSCHRG, gg_val_GG0170C_DSCHRG,
+    gg_val_GG0170D_DSCHRG, gg_val_GG0170E_DSCHRG, gg_val_GG0170F_DSCHRG,
+    gg_val_GG0170I_DSCHRG, gg_val_GG0170J_DSCHRG, gg_val_GG0170R_DSCHRG,
+    gg_val_GG0170S_DSCHRG
+  ) %>%
+  pivot_longer(
+    cols         = starts_with("gg_val_"),
+    names_to     = c("item", "time"),
+    names_pattern = "^(.+)_(ADMSN|DSCHRG)$"
+  )
+
+save_parquet_safe(analysis_data_patient_item, "analysis_data_patient_item.parquet")
+```
+
+```{r}
+analysis_data_patient_item <- load_parquet_safe("analysis_data_patient_item.parquet")
+
+missing_gg_codes <- analysis_data_patient_item %>%
+  dplyr::mutate(
+    error_flag = if_else(as.character(value) %in% c("07","08","09","10","88"), 1, 0),
+    missing_flag = if_else(is.na(value), 1, 0),
+    error_or_missing_flag = if_else(
+      as.character(value) %in% c("07","08","09","10","88") | is.na(value), 1, 0)
+  ) %>%
+  dplyr::group_by(post_acute_setting, time, item) %>%
+  dplyr::summarise(
+    n_records            = dplyr::n(),
+    n_error              = sum(error_flag, na.rm = TRUE),
+    pct_error            = round(100 * n_error / n_records, 2),
+    n_missing            = sum(missing_flag, na.rm = TRUE),
+    pct_missing          = round(100 * n_missing / n_records, 2),
+    n_error_or_missing   = sum(error_or_missing_flag, na.rm = TRUE),
+    pct_error_or_missing = round(100 * n_error_or_missing / n_records, 2),
+    .groups = "drop"
+  ) %>%
+  distinct()
+
+missing_table_path <- file.path(
+  "P:/ORD_Waddell_202408036D/nick/R/Stroke_Rehabilitation/missing_gg_codes_by_setting.xlsx")
+write.xlsx(missing_gg_codes, missing_table_path)
+```
+
+```{r}
+ggplt_items <- analysis_data_patient_item %>%
+  dplyr::group_by(post_acute_setting, time, item, value) %>%
+  dplyr::summarize(n = dplyr::n(), .groups = "drop")
+```
+
+```{r}
+ggplt_items <- ggplt_items %>%
+  dplyr::group_by(post_acute_setting, time, item) %>%
+  dplyr::mutate(perc = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(
+    item = case_when(
+      item == "gg_val_GG0130A" ~ "(1.A) Eating",
+      item == "gg_val_GG0130B" ~ "(1.B) Oral hygiene",
+      item == "gg_val_GG0130C" ~ "(1.C) Toileting hygiene",
+      item == "gg_val_GG0170A" ~ "(2.A) Roll left and right",
+      item == "gg_val_GG0170B" ~ "(2.B) Sit to lying",
+      item == "gg_val_GG0170C" ~ "(2.C) Lying to sitting",
+      item == "gg_val_GG0170D" ~ "(2.D) Sit to stand",
+      item == "gg_val_GG0170E" ~ "(2.E) Chair/bed-to-chair transfer",
+      item == "gg_val_GG0170F" ~ "(2.F) Toilet transfer",
+      item == "gg_val_GG0170I" ~ "(2.I) Walk 10 feet",
+      item == "gg_val_GG0170J" ~ "(2.J) Walk 50 feet (2 turns)",
+      item == "gg_val_GG0170R" ~ "(2.R) Wheel 50 feet (2 turns)",
+      item == "gg_val_GG0170S" ~ "(2.S) Wheel 150 feet"
+    ),
+    value = case_when(
+      value == "01" ~ "01 - Dependent",
+      value == "02" ~ "02 - Substantial assistance",
+      value == "03" ~ "03 - Partial assistance",
+      value == "04" ~ "04 - Supervision or\ntouching assistance",
+      value == "05" ~ "05 - Setup or clean-up\nassistance",
+      value == "06" ~ "06 - Independent",
+      value == "07" ~ "07 - Patient refused",
+      value == "09" ~ "09 - Not applicable",
+      value == "10" ~ "10 - Not attempted due to\nenvironmental limitations",
+      value == "88" ~ "88 - Not attempted due to\nmedical condition or safety",
+      TRUE ~ NA_character_
+    )
+  )
+```
+
+```{r}
+ggplot(ggplt_items %>% filter(post_acute_setting == "HH"),
+       aes(x = perc, y = reorder(item, desc(item)), fill = value)) +
+  geom_col() +
+  scale_x_continuous(labels = scales::percent) +
+  xlab("Percent") + ylab("GG Item") +
+  ggtitle("Home Health GG Item Missingness", subtitle = "2019-2022") +
+  facet_grid(cols = vars(time)) +
+  theme(legend.justification = "center",
+        legend.key = element_rect(fill = "white", color = "black"))
+```
+
+```{r}
+ggplot(ggplt_items %>% filter(post_acute_setting == "IRF"),
+       aes(x = perc, y = reorder(item, desc(item)), fill = value)) +
+  geom_col() +
+  scale_x_continuous(labels = scales::percent) +
+  xlab("Percent") + ylab("GG Item") +
+  ggtitle("IRF GG Item Missingness", subtitle = "2019-2022") +
+  facet_grid(cols = vars(time)) +
+  theme(legend.justification = "center",
+        legend.key = element_rect(fill = "white", color = "black"))
+```
+
+```{r}
+ggplot(ggplt_items %>% filter(post_acute_setting == "SNF"),
+       aes(x = perc, y = reorder(item, desc(item)), fill = value)) +
+  geom_col() +
+  scale_x_continuous(labels = scales::percent) +
+  xlab("Percent") + ylab("GG Item") +
+  ggtitle("SNF GG Item Missingness", subtitle = "2019-2022") +
+  facet_grid(cols = vars(time)) +
+  theme(legend.justification = "center",
+        legend.key = element_rect(fill = "white", color = "black"))
+```
